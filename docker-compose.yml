@@ -1,0 +1,19 @@
+services:
+  # 页面服务：通过 WEB_PORT 发布（默认 8080）。
+  #   WEB_PORT=8080 docker compose up web
+  web:
+    build:
+      context: .
+      target: web
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    restart: unless-stopped
+
+  # 一次性验收服务：类型检查 + Vitest 全量测试 + 生产构建，结束即退出。
+  #   docker compose run --rm verify
+  verify:
+    build:
+      context: .
+      target: verify
+    profiles:
+      - verify

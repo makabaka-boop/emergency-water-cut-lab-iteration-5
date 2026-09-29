@@ -1,0 +1,27 @@
+{
+  "name": "flood-supply-resilience",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "暴雨断管应急供水韧性评估：最大供水量核算、最小割定位与断管演练（纯前端单页）",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "verify": "npm run typecheck && npm run test && npm run build"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11",
+    "vitest": "^2.1.8"
+  }
+}
