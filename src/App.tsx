@@ -1,7 +1,11 @@
-import { ChangeEvent, memo, useMemo, useRef, useState } from 'react'
+import { ChangeEvent, memo, ReactNode, useMemo, useRef, useState } from 'react'
 import { relativeLoss, solvePlan, PlanSolution } from './core/analyze'
 import { jointCommitmentByNode } from './core/commitment'
 import { formatInt, formatPercent } from './core/format'
+import {
+  GapDiagnosis,
+  minimumCommitmentGapByNode,
+} from './core/gap'
 import { sinkIntervalByNode } from './core/interval'
 import {
   LoadSource,
@@ -67,9 +71,11 @@ function buildReport(
 function CutTable({
   cut,
   onDisableArc,
+  toneOf,
 }: {
   cut: CutItem[]
   onDisableArc?: (id: string) => void
+  toneOf?: (kind: CutKind, id: string) => 'none' | 'flow' | 'saturated' | 'short'
 }) {
   if (cut.length === 0) {
     return <p className="muted">割项为空（当前网络无源侧到汇侧的割边）。</p>
@@ -86,28 +92,34 @@ function CutTable({
         </tr>
       </thead>
       <tbody>
-        {cut.map((item) => (
-          <tr key={`${item.kind}:${item.id}`}>
-            <td>{KIND_LABEL[item.kind]}</td>
-            <td className="mono">{item.id}</td>
-            <td className="mono">
-              {item.kind === 'arc' ? `${item.from} → ${item.to}` : '—'}
-            </td>
-            <td className="num mono">{formatInt(item.capacity)}</td>
-            {onDisableArc && (
-              <td>
-                {item.kind === 'arc' && (
-                  <button
-                    className="link-btn"
-                    onClick={() => onDisableArc(item.id)}
-                  >
-                    停用
-                  </button>
-                )}
+        {cut.map((item) => {
+          const tone = toneOf ? toneOf(item.kind, item.id) : 'none'
+          return (
+            <tr
+              key={`${item.kind}:${item.id}`}
+              className={tone !== 'none' ? `tone-row tone-${tone}` : undefined}
+            >
+              <td>{KIND_LABEL[item.kind]}</td>
+              <td className="mono">{item.id}</td>
+              <td className="mono">
+                {item.kind === 'arc' ? `${item.from} → ${item.to}` : '—'}
               </td>
-            )}
-          </tr>
-        ))}
+              <td className="num mono">{formatInt(item.capacity)}</td>
+              {onDisableArc && (
+                <td>
+                  {item.kind === 'arc' && (
+                    <button
+                      className="link-btn"
+                      onClick={() => onDisableArc(item.id)}
+                    >
+                      停用
+                    </button>
+                  )}
+                </td>
+              )}
+            </tr>
+          )
+        })}
       </tbody>
     </table>
   )
@@ -222,12 +234,15 @@ const CommitmentRow = memo(function CommitmentRow({
   value,
   invalid,
   onChange,
+  extra,
 }: {
   node: string
   capacity: number
   value: string
   invalid: boolean
   onChange: (node: string, value: string) => void
+  /** 诊断已提交时附加的「实际供水 / 缺口」单元格。 */
+  extra?: ReactNode
 }) {
   return (
     <tr className={invalid ? 'commit-invalid-row' : ''}>
@@ -249,6 +264,7 @@ const CommitmentRow = memo(function CommitmentRow({
           </span>
         )}
       </td>
+      {extra}
     </tr>
   )
 })
@@ -368,6 +384,163 @@ function JointCommitmentPanel({
   )
 }
 
+/**
+ * 最小承诺缺口诊断面板（opt-in，需显式运行）。
+ *
+ * 与上方实时「联合裁决」相互独立：这里点击「运行诊断」才把当前承诺与当前网络
+ * （含停用管段）提交一次，产出一份不可变的已提交结果——总缺口、逐点实际供水
+ * 与缺口、完整流量见证。页面摘要与网络着色共用同一份已提交结果；承诺或停用
+ * 状态在运行后被改动时，结果标记为「已过期」并停止着色（避免显示不同版本），
+ * 重新运行后刷新。未展开诊断时一切交互与原来完全一致。
+ */
+type GapRunState =
+  | { status: 'idle' }
+  | {
+      status: 'done'
+      diagnosis: GapDiagnosis
+      /** 结果所对应的输入签名（承诺原文 + 停用集合 + 模型）；不一致即过期。 */
+      signature: string
+    }
+  | { status: 'failed'; reason: string }
+
+function GapDiagnosisPanel({
+  sinks,
+  values,
+  onChange,
+  invalidNodes,
+  runState,
+  stale,
+  onRun,
+  onExportWitness,
+}: {
+  sinks: Model['network']['sinks']
+  values: Record<string, string>
+  onChange: (node: string, value: string) => void
+  invalidNodes: string[]
+  runState: GapRunState
+  stale: boolean
+  onRun: () => void
+  onExportWitness: () => void
+}) {
+  const [page, setPage] = useState(0)
+  const pageCount = Math.max(1, Math.ceil(sinks.length / COMMIT_PAGE_SIZE))
+  const safePage = Math.min(page, pageCount - 1)
+  const pageSinks = sinks.slice(
+    safePage * COMMIT_PAGE_SIZE,
+    (safePage + 1) * COMMIT_PAGE_SIZE,
+  )
+  const shown = runState.status === 'done' && !stale ? runState.diagnosis : null
+
+  return (
+    <div className="interval-box">
+      <p className="muted interval-note">
+        当多项最低承诺无法同时兑现时，本诊断在<strong>总送水量仍等于当前网络最大
+        供水量</strong>的全部方案中，把各安置点未达承诺量之和压到最小，并给出
+        总缺口、逐点实际供水/缺口与一份满足全部容量与守恒约束的流量见证。
+        填写承诺后点击「运行诊断」才提交；结果不会把各点单独上限拼成虚假方案。
+      </p>
+
+      <table className="data-table commit-table">
+        <thead>
+          <tr>
+            <th>需求点</th>
+            <th className="num">需求容量</th>
+            <th>最低供水承诺</th>
+            {shown && <th className="num">实际供水（见证）</th>}
+            {shown && <th className="num">缺口</th>}
+          </tr>
+        </thead>
+        <tbody>
+          {pageSinks.map((k) => {
+            const row = shown?.allocations.find((a) => a.sinkNode === k.node)
+            const invalid = invalidNodes.includes(k.node)
+            return (
+              <CommitmentRow
+                key={k.node}
+                node={k.node}
+                capacity={k.capacity}
+                value={values[k.node] ?? ''}
+                invalid={invalid}
+                onChange={onChange}
+                extra={
+                  shown && row ? (
+                    <>
+                      <td className="num mono">
+                        {formatInt(row.delivered)}
+                      </td>
+                      <td
+                        className={`num mono${row.gap > 0 ? ' gap-cell' : ''}`}
+                      >
+                        {row.gap > 0 ? formatInt(row.gap) : '0'}
+                      </td>
+                    </>
+                  ) : undefined
+                }
+              />
+            )
+          })}
+        </tbody>
+      </table>
+      {pageCount > 1 && (
+        <div className="arc-toolbar">
+          <span className="muted">
+            共 {formatInt(sinks.length)} 个需求点 · 第 {safePage + 1} / {pageCount} 页
+          </span>
+          <button disabled={safePage === 0} onClick={() => setPage(safePage - 1)}>
+            上一页
+          </button>
+          <button
+            disabled={safePage >= pageCount - 1}
+            onClick={() => setPage(safePage + 1)}
+          >
+            下一页
+          </button>
+        </div>
+      )}
+
+      <div className="arc-toolbar gap-actions">
+        <button onClick={onRun} disabled={invalidNodes.length > 0}>
+          运行诊断
+        </button>
+        {shown && (
+          <button onClick={onExportWitness}>导出诊断见证 JSON</button>
+        )}
+        {invalidNodes.length > 0 && (
+          <span className="commit-field-error" role="alert">
+            存在无效承诺填写，请先修正
+          </span>
+        )}
+      </div>
+
+      {runState.status === 'failed' && (
+        <p className="interval-error" role="alert">
+          缺口诊断失败：{runState.reason}。已保留上次最大流、联合承诺裁决与停用
+          管段状态不变。
+        </p>
+      )}
+      {stale && runState.status === 'done' && (
+        <p className="gap-stale" role="status">
+          承诺填写或停用管段已变化：下方结果与网络着色为上次提交版本，已过期；
+          重新「运行诊断」后刷新。
+        </p>
+      )}
+      {shown && (
+        <div className="gap-summary" role="status">
+          <div className="value-row">
+            <ValueBlock label="固定总送水量（= 最大供水量）" value={formatInt(shown.total)} />
+            <ValueBlock label="最小总缺口" value={formatInt(shown.totalGap)} />
+            <ValueBlock label="参与承诺点数" value={formatInt(shown.committed)} />
+          </div>
+          <p className="muted interval-note">
+            逐点「实际供水」即见证流量，满足全部管段/供水/需求边容量与节点守恒；
+            未承诺点缺口恒为 0。割项表与管段清单的着色与本结果同源。
+          </p>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function App() {
   const [loader, setLoader] = useState(initialLoaderState)
   const [disabled, setDisabled] = useState<ReadonlySet<string>>(new Set())
@@ -377,6 +550,8 @@ export default function App() {
   const [selectedSink, setSelectedSink] = useState('')
   // 联合最低供水承诺：需求点节点 id → 输入框原文（''=留空）。载入新模型时清空。
   const [commitments, setCommitments] = useState<Record<string, string>>({})
+  // 最小承诺缺口诊断的「已提交结果」（显式运行才产生；摘要/着色/导出共用它）。
+  const [gapRun, setGapRun] = useState<GapRunState>({ status: 'idle' })
   // 文件读取令牌：单调递增，只有仍是在途读取的回填才会被采用。
   const fileToken = useRef(0)
 
@@ -426,13 +601,17 @@ export default function App() {
   // 载入新模型使旧选择失效：区间随之清除（由下方 useMemo 重算），承诺一并清空。
   // 读取 / 解析失败时模型引用不变，本重置不会触发，演练状态全部保留。
   const [prevModel, setPrevModel] = useState(model)
+  // 模型版本号：每次成功载入新模型（引用变化）单调递增，供已提交诊断判定过期。
+  const [modelGeneration, setModelGeneration] = useState(0)
   if (model !== prevModel) {
     setPrevModel(model)
+    setModelGeneration((g) => g + 1)
     setDisabled(new Set())
     setFilter('')
     setPage(0)
     setSelectedSink('')
     setCommitments({})
+    setGapRun({ status: 'idle' })
   }
 
   // 基线方案解（含建模边身份与正反残量），供区间分析复用。
@@ -506,23 +685,28 @@ export default function App() {
     [currentSolution, effectiveSink, disabled.size, baselineIntervalState],
   )
 
+  // 承诺输入的统一解析：filled 为合法 (node,minimum)，invalidNodes 为无效填写点。
+  // 联合裁决与最小缺口诊断共用这一份解析，避免同一输入得出不同结论。
+  const parsedCommitments = useMemo(() => {
+    const filled: { node: string; minimum: number }[] = []
+    const invalidNodes: string[] = []
+    if (!model) return { filled, invalidNodes }
+    for (const k of model.network.sinks) {
+      const raw = commitments[k.node]
+      if (raw === undefined || raw.trim() === '') continue
+      const parsed = parseCommitment(raw, k.capacity)
+      if (parsed.kind !== 'ok') invalidNodes.push(k.node)
+      else filled.push({ node: k.node, minimum: parsed.value })
+    }
+    return { filled, invalidNodes }
+  }, [model, commitments])
+
   // 联合最低供水承诺裁决（仅当前演练；空方案时 currentSolution 即基线解）。
   // 随填写、停用/恢复管段、清空方案（solution 引用变化）重算；
   // 无效填写或辅助求解异常只清除联合裁决并就地提示，不影响其余结果。
   const jointVerdict: JointVerdict = useMemo(() => {
     if (!model || !currentSolution) return { kind: 'idle' }
-    const filled: { node: string; minimum: number }[] = []
-    const invalidNodes: string[] = []
-    for (const k of model.network.sinks) {
-      const raw = commitments[k.node]
-      if (raw === undefined || raw.trim() === '') continue
-      const parsed = parseCommitment(raw, k.capacity)
-      if (parsed.kind !== 'ok') {
-        invalidNodes.push(k.node)
-      } else {
-        filled.push({ node: k.node, minimum: parsed.value })
-      }
-    }
+    const { filled, invalidNodes } = parsedCommitments
     if (invalidNodes.length > 0) return { kind: 'invalid', invalidNodes }
     if (filled.length === 0) return { kind: 'idle' }
     try {
@@ -547,10 +731,114 @@ export default function App() {
         reason: err instanceof Error ? err.message : String(err),
       }
     }
-  }, [model, currentSolution, commitments])
+  }, [model, currentSolution, parsedCommitments])
 
   const onCommitmentChange = (node: string, value: string) => {
     setCommitments((prev) => ({ ...prev, [node]: value }))
+  }
+
+  // 当前输入签名：模型、停用集合（已排序）、承诺原文、当前最大总量。
+  // 已提交诊断只在签名一致时有效；任一变化即标记过期（停止着色与摘要同源展示）。
+  const gapSignature = useMemo(() => {
+    if (!model || !currentSolution) return ''
+    const committed = model.network.sinks
+      .map((k) => `${k.node}=${commitments[k.node] ?? ''}`)
+      .join('|')
+    return [
+      modelGeneration,
+      currentSolution.analysis.value,
+      currentSolution.analysis.disabled.join(','),
+      committed,
+    ].join('#')
+  }, [model, modelGeneration, currentSolution, commitments])
+
+  // 显式提交：按当前承诺与当前网络运行一次诊断，固化为不可变结果。
+  const runGapDiagnosis = () => {
+    if (!model || !currentSolution) return
+    if (parsedCommitments.invalidNodes.length > 0) return
+    try {
+      const result = minimumCommitmentGapByNode(
+        currentSolution,
+        parsedCommitments.filled,
+      )
+      if (!result.ok) {
+        setGapRun({ status: 'failed', reason: result.reason })
+        return
+      }
+      const diagnosis: GapDiagnosis = {
+        total: result.total,
+        totalGap: result.totalGap,
+        committed: result.committed,
+        allocations: result.allocations,
+        witness: result.witness,
+      }
+      setGapRun({ status: 'done', diagnosis, signature: gapSignature })
+    } catch (err) {
+      setGapRun({
+        status: 'failed',
+        reason: err instanceof Error ? err.message : String(err),
+      })
+    }
+  }
+
+  // 已提交且仍与当前输入一致的诊断（摘要与网络着色唯一数据源）。
+  const activeDiagnosis: GapDiagnosis | null =
+    gapRun.status === 'done' && gapRun.signature === gapSignature
+      ? gapRun.diagnosis
+      : null
+  const gapStale = gapRun.status === 'done' && gapRun.signature !== gapSignature
+
+  // 见证流量按边 id 建图（管段 / 需求点），供割项表与管段清单同源着色。
+  const witnessFlowById = useMemo(() => {
+    const map = new Map<string, { flow: number; capacity: number; kind: CutKind }>()
+    if (!activeDiagnosis) return map
+    for (const w of activeDiagnosis.witness.edges) {
+      map.set(`${w.kind}:${w.id}`, {
+        flow: w.flow,
+        capacity: w.capacity,
+        kind: w.kind,
+      })
+    }
+    return map
+  }, [activeDiagnosis])
+
+  // 承诺缺口按需求点节点 id（割项表中的需求点项着色用）。
+  const gapBySinkNode = useMemo(() => {
+    const map = new Map<string, number>()
+    if (activeDiagnosis) {
+      for (const a of activeDiagnosis.allocations) map.set(a.sinkNode, a.gap)
+    }
+    return map
+  }, [activeDiagnosis])
+
+  const exportGapWitness = () => {
+    if (!activeDiagnosis || !model || !currentSolution) return
+    downloadJson('gap-diagnosis-witness.json', {
+      report: 'gap-diagnosis',
+      generatedAt: new Date().toISOString(),
+      network: model.network,
+      disabledArcIds: currentSolution.analysis.disabled,
+      total: activeDiagnosis.total,
+      totalGap: activeDiagnosis.totalGap,
+      allocations: activeDiagnosis.allocations,
+      witness: activeDiagnosis.witness,
+    })
+  }
+
+  // 管段/割项着色等级（与已提交诊断同源；无诊断时不着色）。
+  const arcTone = (
+    kind: CutKind,
+    id: string,
+  ): 'none' | 'flow' | 'saturated' | 'short' => {
+    if (!activeDiagnosis) return 'none'
+    if (kind === 'sink') {
+      const gap = gapBySinkNode.get(id) ?? 0
+      return gap > 0 ? 'short' : 'flow'
+    }
+    const w = witnessFlowById.get(`${kind}:${id}`)
+    if (!w) return 'none'
+    if (w.capacity > 0 && w.flow === 0) return 'none'
+    return w.flow >= w.capacity && w.capacity > 0 ? 'saturated' : 'flow'
   }
 
   const filteredArcs = useMemo(() => {
@@ -762,11 +1050,33 @@ export default function App() {
                   verdict={jointVerdict}
                   onChange={onCommitmentChange}
                 />
+
+                <h3>最小承诺缺口诊断（显式提交）</h3>
+                <GapDiagnosisPanel
+                  sinks={model.network.sinks}
+                  values={commitments}
+                  onChange={onCommitmentChange}
+                  invalidNodes={parsedCommitments.invalidNodes}
+                  runState={gapRun}
+                  stale={gapStale}
+                  onRun={runGapDiagnosis}
+                  onExportWitness={exportGapWitness}
+                />
               </>
             )}
 
+            {activeDiagnosis && (
+              <p className="muted gap-legend" role="note">
+                网络着色（与上方已提交诊断同源）：
+                <span className="tone tone-flow">　</span> 有流量但未饱和的管段
+                /已满足的需求点；
+                <span className="tone tone-saturated">　</span> 饱和管段（瓶颈）；
+                <span className="tone tone-short">　</span> 未达承诺的需求点。
+              </p>
+            )}
+
             <h3>当前割项</h3>
-            <CutTable cut={analysis.cut} onDisableArc={toggleArc} />
+            <CutTable cut={analysis.cut} onDisableArc={toggleArc} toneOf={arcTone} />
 
             <h3>管段清单（勾选停用）</h3>
             <div className="arc-toolbar">
@@ -803,28 +1113,49 @@ export default function App() {
                   <th>ID</th>
                   <th>起点 → 终点</th>
                   <th className="num">容量</th>
+                  {activeDiagnosis && <th className="num">见证流量</th>}
                 </tr>
               </thead>
               <tbody>
-                {pageArcs.map((arc) => (
-                  <tr
-                    key={arc.id}
-                    className={disabled.has(arc.id) ? 'row-disabled' : ''}
-                  >
-                    <td>
-                      <input
-                        type="checkbox"
-                        checked={disabled.has(arc.id)}
-                        onChange={() => toggleArc(arc.id)}
-                      />
-                    </td>
-                    <td className="mono">{arc.id}</td>
-                    <td className="mono">
-                      {arc.from} → {arc.to}
-                    </td>
-                    <td className="num mono">{formatInt(arc.capacity)}</td>
-                  </tr>
-                ))}
+                {pageArcs.map((arc) => {
+                  const isDisabled = disabled.has(arc.id)
+                  const tone =
+                    activeDiagnosis && !isDisabled ? arcTone('arc', arc.id) : 'none'
+                  const w = activeDiagnosis
+                    ? witnessFlowById.get(`arc:${arc.id}`)
+                    : undefined
+                  const rowClass = [
+                    isDisabled ? 'row-disabled' : '',
+                    tone !== 'none' ? `tone-row tone-${tone}` : '',
+                  ]
+                    .filter(Boolean)
+                    .join(' ')
+                  return (
+                    <tr key={arc.id} className={rowClass || undefined}>
+                      <td>
+                        <input
+                          type="checkbox"
+                          checked={isDisabled}
+                          onChange={() => toggleArc(arc.id)}
+                        />
+                      </td>
+                      <td className="mono">{arc.id}</td>
+                      <td className="mono">
+                        {arc.from} → {arc.to}
+                      </td>
+                      <td className="num mono">{formatInt(arc.capacity)}</td>
+                      {activeDiagnosis && (
+                        <td className="num mono">
+                          {isDisabled
+                            ? '—（已停用）'
+                            : w
+                              ? `${formatInt(w.flow)} / ${formatInt(w.capacity)}`
+                              : '—'}
+                        </td>
+                      )}
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           </section>

@@ -344,3 +344,70 @@ button:disabled {
   margin-top: 28px;
   font-size: 13px;
 }
+
+/* 最小承诺缺口诊断：摘要、过期提示与网络着色（与已提交见证同源）。 */
+.gap-actions {
+  margin-top: 10px;
+}
+
+.gap-summary {
+  margin-top: 10px;
+  border: 1px solid #1f5fa8;
+  background: #eef5fc;
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+
+.gap-cell {
+  color: #b03030;
+  font-weight: 700;
+}
+
+.gap-stale {
+  margin: 8px 0 0;
+  border: 1px solid #b06a00;
+  background: #fff5e0;
+  color: #80500a;
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+}
+
+.gap-legend {
+  margin: 8px 0;
+  font-size: 13px;
+}
+
+.tone {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  vertical-align: -1px;
+  margin: 0 4px 0 10px;
+}
+
+.tone-flow {
+  background: #d8ecff;
+}
+
+.tone-saturated {
+  background: #ffd9a8;
+}
+
+.tone-short {
+  background: #f7c4c4;
+}
+
+tr.tone-row.tone-flow > td {
+  background: #f2f8ff;
+}
+
+tr.tone-row.tone-saturated > td {
+  background: #fff4e3;
+}
+
+tr.tone-row.tone-short > td {
+  background: #fdecec;
+}
