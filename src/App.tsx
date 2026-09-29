@@ -1,6 +1,10 @@
 import { ChangeEvent, memo, useMemo, useRef, useState } from 'react'
 import { relativeLoss, solvePlan, PlanSolution } from './core/analyze'
 import { jointCommitmentByNode } from './core/commitment'
+import {
+  CommitmentGapDiagnosis,
+  minimumCommitmentGapByNode,
+} from './core/gap'
 import { formatInt, formatPercent } from './core/format'
 import { sinkIntervalByNode } from './core/interval'
 import {
@@ -215,18 +219,39 @@ type JointVerdict =
   | { kind: 'infeasible'; total: number; committed: number }
   | { kind: 'failed'; reason: string }
 
+type GapDiagnostic =
+  | {
+      kind: 'ok'
+      result: CommitmentGapDiagnosis
+      solution: PlanSolution
+      signature: string
+    }
+  | { kind: 'failed'; reason: string; signature: string }
+
+/** 已提交承诺按需求点顺序生成稳定签名；只有签名、断管集合和解均一致时结果仍有效。 */
+function commitmentSignature(values: Record<string, string>): string {
+  return Object.keys(values)
+    .sort()
+    .map((node) => `${node}=${values[node]}`)
+    .join('|')
+}
+
 /** 单行承诺输入：memo 化避免上万需求点时整表随键入重渲染。 */
 const CommitmentRow = memo(function CommitmentRow({
   node,
   capacity,
   value,
   invalid,
+  allocation,
+  showDiagnosis,
   onChange,
 }: {
   node: string
   capacity: number
   value: string
   invalid: boolean
+  allocation?: CommitmentGapDiagnosis['allocations'][number]
+  showDiagnosis: boolean
   onChange: (node: string, value: string) => void
 }) {
   return (
@@ -249,6 +274,23 @@ const CommitmentRow = memo(function CommitmentRow({
           </span>
         )}
       </td>
+      {showDiagnosis && (
+        <td className="num mono">
+          {!allocation || allocation.committed === null
+            ? '—'
+            : formatInt(allocation.committed)}
+        </td>
+      )}
+      {showDiagnosis && (
+        <td className="num mono">
+          {allocation ? formatInt(allocation.actual) : '—'}
+        </td>
+      )}
+      {showDiagnosis && (
+        <td className={`num mono ${allocation && allocation.gap > 0 ? 'gap-cell' : ''}`}>
+          {allocation ? formatInt(allocation.gap) : '—'}
+        </td>
+      )}
     </tr>
   )
 })
@@ -265,11 +307,19 @@ function JointCommitmentPanel({
   sinks,
   values,
   verdict,
+  activeGap,
+  gapFailure,
+  canSubmitGap,
+  onSubmitGap,
   onChange,
 }: {
   sinks: Model['network']['sinks']
   values: Record<string, string>
   verdict: JointVerdict
+  activeGap: CommitmentGapDiagnosis | null
+  gapFailure: string | null
+  canSubmitGap: boolean
+  onSubmitGap: () => void
   onChange: (node: string, value: string) => void
 }) {
   // 需求点可能上万：分页渲染，配合行 memo 保证键入不卡顿。
@@ -280,6 +330,9 @@ function JointCommitmentPanel({
     safePage * COMMIT_PAGE_SIZE,
     (safePage + 1) * COMMIT_PAGE_SIZE,
   )
+  const allocationByNode = new Map(
+    activeGap?.allocations.map((a) => [a.sinkNode, a]) ?? [],
+  )
 
   return (
     <div className="interval-box">
@@ -289,12 +342,23 @@ function JointCommitmentPanel({
         超级源到超级汇总量严格等于当前最大供水量的同一组边流量上，
         全部下限能否同时满足。
       </p>
+      <div className="arc-toolbar gap-toolbar">
+        <button onClick={onSubmitGap} disabled={!canSubmitGap}>
+          提交并诊断最小承诺缺口
+        </button>
+        <span className="muted">
+          诊断会在总送水量仍为当前最大值的方案中，寻找各点未达承诺量之和最小的同一份联合分配。
+        </span>
+      </div>
       <table className="data-table commit-table">
         <thead>
           <tr>
             <th>需求点</th>
             <th className="num">需求容量</th>
             <th>最低供水承诺</th>
+            {activeGap && <th className="num">承诺量</th>}
+            {activeGap && <th className="num">实际供水</th>}
+            {activeGap && <th className="num">缺口</th>}
           </tr>
         </thead>
         <tbody>
@@ -308,6 +372,8 @@ function JointCommitmentPanel({
                 verdict.kind === 'invalid' &&
                 verdict.invalidNodes.includes(k.node)
               }
+              allocation={allocationByNode.get(k.node)}
+              showDiagnosis={activeGap !== null}
               onChange={onChange}
             />
           ))}
@@ -330,6 +396,57 @@ function JointCommitmentPanel({
         </div>
       )}
 
+      {gapFailure && (
+        <p className="interval-error" role="alert">
+          最小承诺缺口诊断失败（{gapFailure}）；最大流、联合承诺裁决、
+          停用管段与既有展示均未改变。
+        </p>
+      )}
+      {activeGap && (
+        <div className="gap-report" role="status">
+          <div className="value-row">
+            <ValueBlock label="总送水量" value={formatInt(activeGap.total)} />
+            <ValueBlock label="承诺总量" value={formatInt(activeGap.committedTotal)} />
+            <ValueBlock
+              label="最小总缺口"
+              value={formatInt(activeGap.totalGap)}
+            />
+            <ValueBlock
+              label="承诺内已送水量"
+              value={formatInt(activeGap.allocatedToCommitted)}
+            />
+          </div>
+          <p className="muted interval-note">
+            上表的实际供水、缺口与下方管段流量着色均来自同一组已提交、满足容量和
+            节点守恒的流量见证；总送水量严格等于当前网络最大值。
+          </p>
+          <details>
+            <summary>查看流量见证（{formatInt(activeGap.witness.length)} 条建模边）</summary>
+            <table className="data-table witness-table">
+              <thead>
+                <tr>
+                  <th>类别</th>
+                  <th>ID</th>
+                  <th>起点 → 终点</th>
+                  <th className="num">流量 / 容量</th>
+                </tr>
+              </thead>
+              <tbody>
+                {activeGap.witness.map((w) => (
+                  <tr key={`${w.kind}:${w.id}`}>
+                    <td>{KIND_LABEL[w.kind]}</td>
+                    <td className="mono">{w.id}</td>
+                    <td className="mono">{w.from} → {w.to}</td>
+                    <td className="num mono">
+                      {formatInt(w.flow)} / {formatInt(w.capacity)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </details>
+        </div>
+      )}
       {verdict.kind === 'invalid' && (
         <p className="interval-error" role="alert">
           存在无效填写{verdict.invalidNodes.length > 1 ? `（${verdict.invalidNodes.length} 处）` : ''}
@@ -377,6 +494,8 @@ export default function App() {
   const [selectedSink, setSelectedSink] = useState('')
   // 联合最低供水承诺：需求点节点 id → 输入框原文（''=留空）。载入新模型时清空。
   const [commitments, setCommitments] = useState<Record<string, string>>({})
+  // 联合最低承诺缺口诊断只在工程师明确提交时生成；输入或方案变化立即作废。
+  const [gapDiagnostic, setGapDiagnostic] = useState<GapDiagnostic | null>(null)
   // 文件读取令牌：单调递增，只有仍是在途读取的回填才会被采用。
   const fileToken = useRef(0)
 
@@ -433,6 +552,7 @@ export default function App() {
     setPage(0)
     setSelectedSink('')
     setCommitments({})
+    setGapDiagnostic(null)
   }
 
   // 基线方案解（含建模边身份与正反残量），供区间分析复用。
@@ -549,9 +669,60 @@ export default function App() {
     }
   }, [model, currentSolution, commitments])
 
+  const canSubmitGap = model !== null && currentSolution !== null && jointVerdict.kind !== 'invalid'
+
+  const submitGapDiagnosis = () => {
+    if (!model || !currentSolution) return
+    const filled: { node: string; minimum: number }[] = []
+    for (const k of model.network.sinks) {
+      const raw = commitments[k.node]
+      if (raw === undefined || raw.trim() === '') continue
+      const parsed = parseCommitment(raw, k.capacity)
+      if (parsed.kind !== 'ok') return
+      filled.push({ node: k.node, minimum: parsed.value })
+    }
+    const signature = commitmentSignature(commitments)
+    try {
+      const result = minimumCommitmentGapByNode(model.network, currentSolution, filled)
+      if (!result.ok) {
+        setGapDiagnostic({ kind: 'failed', reason: result.reason, signature })
+        return
+      }
+      setGapDiagnostic({
+        kind: 'ok',
+        result,
+        solution: currentSolution,
+        signature,
+      })
+    } catch (err) {
+      setGapDiagnostic({
+        kind: 'failed',
+        reason: err instanceof Error ? err.message : String(err),
+        signature,
+      })
+    }
+  }
+
   const onCommitmentChange = (node: string, value: string) => {
     setCommitments((prev) => ({ ...prev, [node]: value }))
+    setGapDiagnostic(null)
   }
+
+  const activeGap =
+    gapDiagnostic?.kind === 'ok' &&
+    gapDiagnostic.solution === currentSolution &&
+    gapDiagnostic.signature === commitmentSignature(commitments)
+      ? gapDiagnostic.result
+      : null
+
+  const witnessFlowByArc = useMemo(() => {
+    const map = new Map<string, { flow: number; capacity: number }>()
+    if (!activeGap) return map
+    for (const edge of activeGap.witness) {
+      if (edge.kind === 'arc') map.set(edge.id, { flow: edge.flow, capacity: edge.capacity })
+    }
+    return map
+  }, [activeGap])
 
   const filteredArcs = useMemo(() => {
     if (!model) return []
@@ -577,9 +748,13 @@ export default function App() {
       next.add(id)
     }
     setDisabled(next)
+    setGapDiagnostic(null)
   }
 
-  const clearPlan = () => setDisabled(new Set())
+  const clearPlan = () => {
+    setDisabled(new Set())
+    setGapDiagnostic(null)
+  }
 
   return (
     <div className="page">
@@ -760,6 +935,12 @@ export default function App() {
                   sinks={model.network.sinks}
                   values={commitments}
                   verdict={jointVerdict}
+                  activeGap={activeGap}
+                  gapFailure={
+                    gapDiagnostic?.kind === 'failed' ? gapDiagnostic.reason : null
+                  }
+                  canSubmitGap={canSubmitGap}
+                  onSubmitGap={submitGapDiagnosis}
                   onChange={onCommitmentChange}
                 />
               </>
@@ -796,6 +977,14 @@ export default function App() {
                 下一页
               </button>
             </div>
+            {activeGap && (
+              <div className="flow-legend muted">
+                管段按已提交流量见证着色：
+                <span className="flow-zero">零流量</span>
+                <span className="flow-positive">有流量未饱和</span>
+                <span className="flow-saturated">饱和</span>
+              </div>
+            )}
             <table className="data-table">
               <thead>
                 <tr>
@@ -803,13 +992,25 @@ export default function App() {
                   <th>ID</th>
                   <th>起点 → 终点</th>
                   <th className="num">容量</th>
+                  {activeGap && <th className="num">见证流量</th>}
                 </tr>
               </thead>
               <tbody>
-                {pageArcs.map((arc) => (
+                {pageArcs.map((arc) => {
+                  const flowState = witnessFlowByArc.get(arc.id)
+                  const flowClass = !activeGap || disabled.has(arc.id) || !flowState
+                    ? ''
+                    : flowState.flow === 0
+                      ? 'flow-zero-row'
+                      : flowState.flow >= flowState.capacity
+                        ? 'flow-saturated-row'
+                        : 'flow-positive-row'
+                  return (
                   <tr
                     key={arc.id}
-                    className={disabled.has(arc.id) ? 'row-disabled' : ''}
+                    className={[disabled.has(arc.id) ? 'row-disabled' : '', flowClass]
+                      .filter(Boolean)
+                      .join(' ')}
                   >
                     <td>
                       <input
@@ -823,8 +1024,16 @@ export default function App() {
                       {arc.from} → {arc.to}
                     </td>
                     <td className="num mono">{formatInt(arc.capacity)}</td>
+                    {activeGap && (
+                      <td className="num mono">
+                        {disabled.has(arc.id)
+                          ? '—'
+                          : formatInt(witnessFlowByArc.get(arc.id)?.flow ?? 0)}
+                      </td>
+                    )}
                   </tr>
-                ))}
+                  )
+                })}
               </tbody>
             </table>
           </section>

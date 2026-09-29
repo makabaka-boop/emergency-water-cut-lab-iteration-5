@@ -34,13 +34,14 @@ export function maxFlow(
   edges: FlowEdge[],
   source: number,
   sink: number,
+  initialFlow: ReadonlyArray<number> | Float64Array = [],
 ): MaxFlowResult {
   const m = edges.length
   const arcCount = 2 * m
   const head = new Int32Array(nodeCount).fill(-1)
   const to = new Int32Array(arcCount)
   const next = new Int32Array(arcCount)
-  // cap 为残量：正向弧初始为容量，反向弧初始为 0。
+  // cap 为残量：正向弧初始为容量 − 初始流量，反向弧初始为初始流量。
   const cap = new Float64Array(arcCount)
 
   for (let i = 0; i < m; i++) {
@@ -49,11 +50,15 @@ export function maxFlow(
     to[e] = dst
     next[e] = head[from]
     head[from] = e
-    cap[e] = capacity
+    const f = initialFlow[i] ?? 0
+    if (!Number.isSafeInteger(f) || f < 0 || f > capacity) {
+      throw new RangeError('初始流量必须是容量范围内的安全整数')
+    }
+    cap[e] = capacity - f
     to[e + 1] = from
     next[e + 1] = head[dst]
     head[dst] = e + 1
-    cap[e + 1] = 0
+    cap[e + 1] = f
   }
 
   const level = new Int32Array(nodeCount)
@@ -130,6 +135,9 @@ export function maxFlow(
   }
 
   let value = 0
+  for (let i = 0; i < m; i++) {
+    if (edges[i].from === source) value += initialFlow[i] ?? 0
+  }
   while (bfs()) {
     value += blockingFlow()
   }

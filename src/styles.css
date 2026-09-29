@@ -273,6 +273,64 @@ button:disabled {
   font-size: 14px;
 }
 
+.gap-toolbar {
+  margin: 10px 0;
+}
+
+.gap-report {
+  margin-top: 10px;
+  border: 1px solid #bcd2e8;
+  background: #f5faff;
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.gap-report details {
+  margin-top: 8px;
+}
+
+.witness-table {
+  margin-top: 8px;
+  max-height: 320px;
+  overflow: auto;
+  display: block;
+}
+
+.gap-cell {
+  color: var(--danger);
+  font-weight: 700;
+}
+
+.flow-legend {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  margin: 6px 0;
+}
+
+.flow-legend span {
+  border-radius: 4px;
+  padding: 2px 8px;
+}
+
+.flow-legend .flow-zero,
+.flow-zero-row {
+  background: #eef0f2;
+  color: var(--muted);
+}
+
+.flow-legend .flow-positive,
+.flow-positive-row {
+  background: #e8f4ec;
+}
+
+.flow-legend .flow-saturated,
+.flow-saturated-row {
+  background: #fff1d6;
+}
+
 .data-table {
   width: 100%;
   border-collapse: collapse;
